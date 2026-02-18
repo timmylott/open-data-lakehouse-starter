@@ -1,0 +1,138 @@
+services:
+  # PostgreSQL - Metadata store for Nessie
+  postgres:
+    image: postgres:15
+    container_name: postgres-metadata
+    environment:
+      POSTGRES_DB: nessie
+      POSTGRES_USER: nessie
+      POSTGRES_PASSWORD: nessie123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nessie"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO - Object Storage (S3-compatible)
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    ports:
+      - "9000:9000"      # API
+      - "9001:9001"      # Console
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # MinIO Client - Create buckets on startup
+  minio-setup:
+    image: minio/mc:latest
+    container_name: minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - data-platform
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 admin password123;
+      mc mb myminio/warehouse --ignore-existing;
+      mc mb myminio/uploads --ignore-existing;
+      mc mb myminio/exports --ignore-existing;
+      mc mb myminio/staging --ignore-existing;
+      mc mb myminio/backups --ignore-existing;
+      mc anonymous set download myminio/warehouse;
+      echo 'MinIO buckets created successfully';
+      echo 'Warehouse bucket: Iceberg data (raw/bronze/silver/gold as subdirectories)';
+      echo 'Uploads bucket: Customer file uploads (CSV, Parquet, etc.)';
+      echo 'Exports bucket: Generated reports and data exports';
+      echo 'Staging bucket: Temporary/intermediate processing files';
+      echo 'Backups bucket: System backups and archives';
+      exit 0;
+      "
+
+  # Nessie - Catalog server for Iceberg
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.95.0
+    container_name: nessie
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Use PostgreSQL for version store
+      nessie.version.store.type: JDBC
+      quarkus.datasource.jdbc.url: jdbc:postgresql://postgres:5432/nessie
+      quarkus.datasource.username: nessie
+      quarkus.datasource.password: nessie123
+      quarkus.datasource.jdbc.driver: org.postgresql.Driver
+    ports:
+      - "19120:19120"    # API
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Spark - For Iceberg operations and transformations
+  spark-iceberg:
+    image: apache/spark:3.5.0-scala2.12-java11-python3-ubuntu
+    container_name: spark-iceberg
+    depends_on:
+      - minio
+      - nessie
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-iceberg
+      - SPARK_MASTER_PORT=7077
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password123
+      - AWS_REGION=us-east-1
+    ports:
+      - "8080:8080"      # Spark UI
+      - "7077:7077"      # Spark Master
+      - "4040:4040"      # Spark Job UI
+      - "8888:8888"      # Jupyter
+    volumes:
+      - ./notebooks:/notebooks
+      - ./scripts:/scripts
+      - ./config:/config
+    networks:
+      - data-platform
+    command: >
+      bash -c "
+      pip install --quiet --no-cache-dir pyspark==3.5.0 jupyterlab pynessie pyiceberg pandas &&
+      mkdir -p /opt/spark/jars &&
+      curl -L -o /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.4.3.jar https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.3/iceberg-spark-runtime-3.5_2.12-1.4.3.jar &&
+      curl -L -o /opt/spark/jars/nessie-spark-extensions-3.5_2.12-0.95.0.jar https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.95.0/nessie-spark-extensions-3.5_2.12-0.95.0.jar &&
+      curl -L -o /opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar &&
+      curl -L -o /opt/spark/jars/hadoop-aws-3.3.4.jar https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar &&
+      /opt/spark/sbin/start-master.sh &&
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token='' --NotebookApp.password='' --notebook-dir=/notebooks
+      "
+    user: root
+
+networks:
+  data-platform:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  minio-data:
