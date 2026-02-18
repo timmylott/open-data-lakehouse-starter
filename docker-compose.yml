@@ -1,4 +1,8 @@
 services:
+  # =============================================================================
+  # PHASE 1: STORAGE LAYER
+  # =============================================================================
+
   # PostgreSQL - Metadata store for Nessie
   postgres:
     image: postgres:15
@@ -118,7 +122,7 @@ services:
       - data-platform
     command: >
       bash -c "
-      pip install --quiet --no-cache-dir pyspark==3.5.0 jupyterlab pynessie pyiceberg pandas &&
+      pip install --quiet --no-cache-dir pyspark==3.5.0 jupyterlab pynessie pyiceberg pandas psycopg2-binary kafka-python &&
       mkdir -p /opt/spark/jars &&
       curl -L -o /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.4.3.jar https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.3/iceberg-spark-runtime-3.5_2.12-1.4.3.jar &&
       curl -L -o /opt/spark/jars/nessie-spark-extensions-3.5_2.12-0.95.0.jar https://repo1.maven.org/maven2/org/projectnessie/nessie-integrations/nessie-spark-extensions-3.5_2.12/0.95.0/nessie-spark-extensions-3.5_2.12-0.95.0.jar &&
@@ -129,6 +133,128 @@ services:
       "
     user: root
 
+  # =============================================================================
+  # PHASE 2: DATABASE REPLICATION (PostgreSQL CDC)
+  # =============================================================================
+
+  # PostgreSQL Source - HR System Database
+  postgres-source-hr:
+    image: postgres:15
+    container_name: postgres-source-hr
+    environment:
+      POSTGRES_DB: hr_system
+      POSTGRES_USER: hr_user
+      POSTGRES_PASSWORD: hr_pass123
+    ports:
+      - "5433:5432"  # Different port to avoid conflict with metadata DB
+    volumes:
+      - postgres-source-hr-data:/var/lib/postgresql/data
+      - ./config/postgres-source/init-hr-schema.sql:/docker-entrypoint-initdb.d/01-init-schema.sql
+      - ./config/postgres-source/postgresql.conf:/etc/postgresql/postgresql.conf
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hr_user -d hr_system"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Zookeeper - Required for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kafka - Event Streaming Platform
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168  # 7 days
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Kafka UI - Web interface for Kafka
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8090:8080"
+    networks:
+      - data-platform
+
+  # Debezium Connect - CDC Platform
+  debezium:
+    image: debezium/connect:2.5
+    container_name: debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres-source-hr:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      STATUS_STORAGE_TOPIC: debezium_statuses
+      # Increase replication factors for production
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+    ports:
+      - "8083:8083"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 networks:
   data-platform:
     driver: bridge
@@ -136,3 +262,7 @@ networks:
 volumes:
   postgres-data:
   minio-data:
+  postgres-source-hr-data:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:

@@ -1,0 +1,32 @@
+{
+  "name": "hr-postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres-source-hr",
+    "database.port": "5432",
+    "database.user": "hr_user",
+    "database.password": "hr_pass123",
+    "database.dbname": "hr_system",
+    "database.server.name": "hr_postgres",
+    "table.include.list": "hr.departments,hr.employees,hr.job_history",
+    "plugin.name": "pgoutput",
+    "publication.autocreate.mode": "filtered",
+    "slot.name": "debezium_hr",
+    "topic.prefix": "hr",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "schema-changes.hr",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+    "transforms": "unwrap",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.unwrap.delete.handling.mode": "rewrite",
+    "snapshot.mode": "initial",
+    "time.precision.mode": "adaptive_time_microseconds",
+    "decimal.handling.mode": "double",
+    "include.schema.changes": "true"
+  }
+}
